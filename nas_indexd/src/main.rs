@@ -44,6 +44,8 @@ struct AppState {
     index: RwLock<LiveIndex>,
     scanning: AtomicBool,
     watcher_status: RwLock<String>,
+    watched_dirs: AtomicU64,
+    watch_errors: AtomicU64,
     events_processed: AtomicU64,
     root: PathBuf,
     excludes: Vec<String>,
@@ -75,6 +77,8 @@ fn main() {
         }),
         scanning: AtomicBool::new(false),
         watcher_status: RwLock::new("starting".to_string()),
+        watched_dirs: AtomicU64::new(0),
+        watch_errors: AtomicU64::new(0),
         events_processed: AtomicU64::new(0),
         root: PathBuf::from(&root_str),
         excludes,
@@ -176,32 +180,70 @@ fn run_watcher(state: Arc<AppState>) {
         }
     };
 
-    if let Err(e) = watcher.watch(&state.root, RecursiveMode::Recursive) {
-        let msg = format!("watch error: {e}");
-        eprintln!("[nas_indexd] Watcher {msg}");
-        if let Ok(mut ws) = state.watcher_status.write() {
-            *ws = msg;
+    // Register NonRecursive watches only on non-excluded directories so `.@__thumb`,
+    // `@Recycle`, `.qpkg`, and `.snapshot` never exhaust `fs.inotify.max_user_watches`.
+    let mut watched: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut last_err = String::new();
+
+    let walker = WalkDir::new(&state.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            if !e.file_type().is_dir() {
+                return false;
+            }
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            !state.excludes.iter().any(|ex| ex == &name)
+        });
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_dir() {
+            continue;
         }
-        return;
+        match watcher.watch(entry.path(), RecursiveMode::NonRecursive) {
+            Ok(()) => watched += 1,
+            Err(e) => {
+                errors += 1;
+                if last_err.is_empty() {
+                    last_err = e.to_string();
+                }
+            }
+        }
     }
 
-    eprintln!("[nas_indexd] Real-time filesystem watcher active on {:?}", state.root);
+    state.watched_dirs.store(watched, Ordering::Relaxed);
+    state.watch_errors.store(errors, Ordering::Relaxed);
+
+    let status_msg = if errors == 0 {
+        format!("active ({watched} dirs)")
+    } else {
+        format!("partial ({watched} dirs, {errors} errors: {last_err})")
+    };
+    eprintln!("[nas_indexd] Watcher {status_msg}");
+    if errors > 0 {
+        eprintln!(
+            "[nas_indexd] Hint: if 'No space left on device' (os error 28), increase host limit: sysctl -w fs.inotify.max_user_watches=524288"
+        );
+    }
     if let Ok(mut ws) = state.watcher_status.write() {
-        *ws = "active".to_string();
+        *ws = status_msg;
     }
 
     for res in rx {
         match res {
-            Ok(event) => apply_fs_event(&state, event),
+            Ok(event) => apply_fs_event(&state, &mut watcher, event),
             Err(e) => eprintln!("[nas_indexd] Watch event error: {e}"),
         }
     }
 }
 
-fn apply_fs_event(state: &AppState, event: Event) {
-    match event.kind {
-        EventKind::Access(_) => return, // Ignore pure read/open events
-        _ => {}
+fn apply_fs_event(state: &AppState, watcher: &mut RecommendedWatcher, event: Event) {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return;
     }
 
     state.events_processed.fetch_add(1, Ordering::Relaxed);
@@ -220,12 +262,14 @@ fn apply_fs_event(state: &AppState, event: Event) {
         let key = rel_path.to_lowercase();
 
         if path.exists() {
-            // File/directory created, modified, or moved in.
             if let Some(entry) = build_entry(state, &path) {
                 let is_dir = entry.is_dir;
                 let mut subtree = Vec::new();
                 if is_dir {
-                    // Index any children if a populated directory was moved in.
+                    // Watch newly created/moved-in directory and any subdirectories.
+                    if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+                        state.watched_dirs.fetch_add(1, Ordering::Relaxed);
+                    }
                     for child in WalkDir::new(&path)
                         .follow_links(false)
                         .into_iter()
@@ -234,6 +278,11 @@ fn apply_fs_event(state: &AppState, event: Event) {
                     {
                         if child.depth() == 0 {
                             continue;
+                        }
+                        if child.file_type().is_dir()
+                            && watcher.watch(child.path(), RecursiveMode::NonRecursive).is_ok()
+                        {
+                            state.watched_dirs.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Some(ce) = build_entry(state, child.path()) {
                             subtree.push(ce);
@@ -248,7 +297,6 @@ fn apply_fs_event(state: &AppState, event: Event) {
                 }
             }
         } else {
-            // File/directory deleted or moved out.
             let dir_prefix = format!("{key}/");
             if let Ok(mut idx) = state.index.write() {
                 let removed = idx.entries.remove(&key);
@@ -384,6 +432,8 @@ fn handle_client(mut stream: TcpStream, state: &Arc<AppState>) -> std::io::Resul
                 .map(|s| s.clone())
                 .unwrap_or_else(|_| "unknown".to_string());
             let events = state.events_processed.load(Ordering::Relaxed);
+            let watched_dirs = state.watched_dirs.load(Ordering::Relaxed);
+            let watch_errors = state.watch_errors.load(Ordering::Relaxed);
             let status = if scanning && indexed == 0 {
                 "indexing"
             } else {
@@ -392,7 +442,7 @@ fn handle_client(mut stream: TcpStream, state: &Arc<AppState>) -> std::io::Resul
             let mut w_esc = String::new();
             push_json_escaped(&mut w_esc, &watcher);
             let body = format!(
-                r#"{{"status":"{status}","indexed":{indexed},"scanning":{scanning},"last_scan_ms":{last_scan_ms},"watcher":"{w_esc}","events":{events}}}"#
+                r#"{{"status":"{status}","indexed":{indexed},"scanning":{scanning},"last_scan_ms":{last_scan_ms},"watcher":"{w_esc}","watched_dirs":{watched_dirs},"watch_errors":{watch_errors},"events":{events}}}"#
             );
             send_json(&mut stream, 200, &body)
         }
