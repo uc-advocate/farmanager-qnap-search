@@ -1,0 +1,28 @@
+[package]
+name = "far_qsirch"
+version = "0.1.0"
+edition = "2021"
+description = "FAR Manager 3 x64 native plugin merging local file search with QNAP Qsirch 7.x"
+
+[lib]
+name = "far_qsirch"
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.22"
+walkdir = "2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WNet",
+    "Win32_Networking_WinHttp",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"

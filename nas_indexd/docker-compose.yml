@@ -1,0 +1,21 @@
+# Paste this into QNAP Container Station -> Applications -> Create
+# (or run `docker compose up -d --build` inside the `nas_indexd` folder on your QNAP via SSH).
+services:
+  nas-indexd:
+    build: .
+    container_name: nas-indexd
+    restart: unless-stopped
+    ports:
+      - "9876:9876"
+    volumes:
+      # Mount your QNAP shares read-only.
+      # Tip: on QTS, `/share/CACHEDEV1_DATA` contains all real share folders without symlinks.
+      - /share/CACHEDEV1_DATA:/data:ro
+    environment:
+      INDEX_ROOT: /data
+      LISTEN_ADDR: 0.0.0.0:9876
+      # Real-time inotify watcher keeps the index updated automatically (0 = no periodic rescan)
+      REFRESH_SECS: "0"
+      # Optional: set an API key and enter the same key in FarQsirch Settings (far_qsirch.toml)
+      # API_KEY: "my-secret-token"
+      INDEX_EXCLUDES: ".@__thumb,@Recycle,.streams,.qpkg,lost+found,.Trash-1000,.snapshot,@Recently-Snapshot"

@@ -1,0 +1,19 @@
+# Rust build outputs
+/target/
+/nas_indexd/target/
+
+# Exported Docker image archives
+*.tar
+*.tar.gz
+*.tgz
+
+# Local runtime config & session cache (never commit credentials)
+far_qsirch.toml
+far_qsirch_session.*
+*.local.toml
+
+# OS / IDE junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
